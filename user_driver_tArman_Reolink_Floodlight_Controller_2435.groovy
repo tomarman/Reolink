@@ -43,7 +43,7 @@ def off() {
 def refresh() {
     ensureToken { token ->
         sendFloodlightCommand(0, token, "off")
-        setFlaoodlightMode("auto") 
+        setFloodlightMode("auto") 
     }
 }
 
@@ -60,7 +60,7 @@ def turnOffFloodlight() {
 }
 
 // Set floodlight mode using an enum/selector
-def setFlaoodlightMode(mode) {
+def setFloodlightMode(mode) {
     def modeMap = [off:0, auto:1, on:2, timer:3]
     def modeVal = modeMap[mode]
     if(modeVal==null) {
