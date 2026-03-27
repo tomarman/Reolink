@@ -1,14 +1,26 @@
 /**
  * Reolink Elite Wifi Floodlight Camera Controller for Hubitat
- * Controls the floodlight via Reolink's HTTP API (login, retain/use token, floodlight on/off)
- * Uses SetWhiteLed API command for floodlight
- * Adds setFloodlightMode(mode) command using an enum/selector for mode
- * Author: Copilot GitHub (2024)
+ *
+ * Controls the floodlight via Reolink's HTTP API (Login, then SetWhiteLed).
+ * Auth token is obtained on demand and cached in state["reolinkToken"].
+ *
+ * Token retry behavior:
+ *   On a 401 response from SetWhiteLed, the cached token is cleared, a new
+ *   token is obtained via Login, and the original command (same desiredState
+ *   and desiredMode) is retried exactly once.
+ *
+ * refresh() behavior:
+ *   refresh() is intentionally a RESET-TO-AUTO operation. It turns the
+ *   floodlight off and then sets mode to "auto" (motion-triggered).
+ *   This is by design — it is not a read-only status query.
+ *
+ * Author: TArman (2024)
  */
 
 metadata {
     definition(name: "Reolink Floodlight Controller", namespace: "tArman", author: "TArman") {
         capability "Switch"
+        attribute "mode", "string"
         command "refresh"
         command "turnOnFloodlight"
         command "turnOffFloodlight"
@@ -22,7 +34,6 @@ metadata {
 }
 
 def stateTokenKey = "reolinkToken"
-def mode = 1
 
 // On install/updated
 def installed() { initialize() }
@@ -40,10 +51,14 @@ def off() {
     turnOffFloodlight()
 }
 
+// refresh() intentionally resets the floodlight to auto/motion mode.
+// Turns the light off first, then switches mode to "auto" (motion-triggered).
 def refresh() {
     ensureToken { token ->
+        // Step 1: turn light off
         sendFloodlightCommand(0, token, "off")
-        setFloodlightMode("auto") 
+        // Step 2: restore auto/motion mode
+        setFloodlightMode("auto")
     }
 }
 
@@ -124,17 +139,21 @@ def processLoginResponse(resp, data) {
     }
 }
 
-// Sends HTTP command to control floodlight (state: 1=on, 0=off), mode=1 by default
-private sendFloodlightCommand(state, token, mode, retryOnAuthFail = true) {
+// Sends HTTP command to control floodlight (desiredState: 1=on, 0=off, desiredMode: off/auto/on/timer)
+private sendFloodlightCommand(desiredState, token, desiredMode, retryOnAuthFail = true) {
     def modeMap = [off:0, auto:1, on:2, timer:3]
-    def modeVal = modeMap[mode]
+    def modeVal = modeMap[desiredMode]
+    if (modeVal == null) {
+        log.warn "Invalid mode '${desiredMode}' for sendFloodlightCommand (valid: off, auto, on, timer). Command not sent."
+        return
+    }
     def cmdBody = [
         [
             cmd: "SetWhiteLed",
             action: 0,
             param: [
                 WhiteLed: [
-                    state: state,
+                    state: desiredState,
                     mode: modeVal,
                     channel: 0
                 ]
@@ -146,18 +165,19 @@ private sendFloodlightCommand(state, token, mode, retryOnAuthFail = true) {
         contentType: "application/json",
         body: groovy.json.JsonOutput.toJson(cmdBody)
     ]
-    asynchttpPost("processFloodlightResponse", params, [desiredState: state, retried: !retryOnAuthFail])
+    // hasRetried=true means we already retried once; do not retry again
+    asynchttpPost("processFloodlightResponse", params, [desiredState: desiredState, desiredMode: desiredMode, hasRetried: !retryOnAuthFail])
 }
 
 // Sends HTTP command to set floodlight mode only
-private sendFloodlightModeCommand(mode, token, retryOnAuthFail = true) {
+private sendFloodlightModeCommand(modeVal, token, retryOnAuthFail = true) {
     def cmdBody = [
         [
             cmd: "SetWhiteLed",
             action: 0,
             param: [
                 WhiteLed: [
-                    mode: mode,
+                    mode: modeVal,
                     channel: 0
                 ]
             ]
@@ -168,20 +188,22 @@ private sendFloodlightModeCommand(mode, token, retryOnAuthFail = true) {
         contentType: "application/json",
         body: groovy.json.JsonOutput.toJson(cmdBody)
     ]
-    asynchttpPost("processFloodlightModeResponse", params, [desiredMode: mode, retried: !retryOnAuthFail])
+    // hasRetried=true means we already retried once; do not retry again
+    asynchttpPost("processFloodlightModeResponse", params, [desiredMode: modeVal, hasRetried: !retryOnAuthFail])
 }
 
 def processFloodlightResponse(resp, data) {
     def desiredState = data.desiredState
+    def desiredMode  = data.desiredMode
     if (resp.getStatus() == 200) {
         sendEvent(name: "switch", value: desiredState ? "on" : "off")
         log.info "Floodlight ${desiredState ? 'on' : 'off'} successfully..$data"
-    } else if (resp.getStatus() == 401 && !data.retried) {
-        // Token expired: clear token and retry
+    } else if (resp.getStatus() == 401 && !data.hasRetried) {
+        // Token expired: clear cached token, obtain a fresh one, and retry with same state and mode
         log.warn "Token expired, refreshing token and retrying..."
         state.remove(stateTokenKey)
         ensureToken { token ->
-            sendFloodlightCommand(desiredState, token, false)
+            sendFloodlightCommand(desiredState, token, desiredMode, false)
         }
     } else {
         log.error "Error setting floodlight: status=${resp.getStatus()}, data=${resp.getData()}"
@@ -191,13 +213,13 @@ def processFloodlightResponse(resp, data) {
 // Handle response from setFloodlightMode
 def processFloodlightModeResponse(resp, data) {
     def desiredMode = data.desiredMode
-    def modeMap = [0:"off", 1:"auto", 2:"on", 3:"timer"]
-    def modeVal = modeMap[desiredMode]
+    def modeNames = [0:"off", 1:"auto", 2:"on", 3:"timer"]
+    def modeName = modeNames[desiredMode]
     if (resp.getStatus() == 200) {
-        log.info "Floodlight mode set to $modeVal successfully...$desiredMode"
-        mode = desiredMode
-        sendEvent(name: "mode", value: modeVal)
-    } else if (resp.getStatus() == 401 && !data.retried) {
+        log.info "Floodlight mode set to $modeName successfully...$desiredMode"
+        state.floodlightMode = desiredMode
+        sendEvent(name: "mode", value: modeName)
+    } else if (resp.getStatus() == 401 && !data.hasRetried) {
         log.warn "Token expired, refreshing token and retrying (mode)..."
         state.remove(stateTokenKey)
         ensureToken { token ->
